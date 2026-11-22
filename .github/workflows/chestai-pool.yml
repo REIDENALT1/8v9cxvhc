@@ -1,0 +1,113 @@
+name: chestai-pool
+
+# Machines of this repo that join a Chest AI training run of another repo
+# (pool.json "main", at the commit "ref"): copy this file to
+# .github/workflows/chestai-pool.yml of a public repo, and pool.json (written by
+# chestai/pool/launch.py of the main repo) to its root; a push that changes
+# pool.json starts them. They train with the main repo's code at "ref", push
+# their round files to this repo's branches chestai-sync/m<id> (with this repo's
+# own token) and read the other machines' from every repo of the run through
+# their public URLs. The weights are published by the main repo only: nothing
+# is uploaded here but each machine's log.
+on:
+  push:
+    branches-ignore: ["chestai-sync/**"]
+    paths: ["pool.json"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chestai-pool
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      ids: ${{ steps.p.outputs.ids }}
+      cfg: ${{ steps.p.outputs.cfg }}
+      main: ${{ steps.r.outputs.main }}
+      ref: ${{ steps.r.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: r
+        run: |
+          python3 -c "import json;p=json.load(open('pool.json'));print('main='+p['main']);print('ref='+p['ref'])" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.r.outputs.main }}
+          ref: ${{ steps.r.outputs.ref }}
+          path: main
+          persist-credentials: false
+          # chestai/pool and the files right in chestai/ (run.json).
+          sparse-checkout: chestai/pool
+      - id: p
+        run: |
+          python3 main/chestai/pool/plan.py plan --run main/chestai/run.json --pool pool.json \
+            --self "$GITHUB_REPOSITORY" --sha "$(git -C main rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  train:
+    needs: plan
+    runs-on: ${{ fromJSON(needs.plan.outputs.cfg).runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(needs.plan.outputs.ids) }}
+    defaults:
+      run:
+        working-directory: main/chestai
+    steps:
+      # This repo (its origin and token: the sync branches), then the main repo's code at "ref".
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.plan.outputs.main }}
+          ref: ${{ needs.plan.outputs.ref }}
+          path: main
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: main/chestai/chestsim/target
+          key: chestai-chestsim-${{ hashFiles('main/chestai/chestsim/Cargo.toml', 'main/chestai/chestsim/src/**') }}
+      - run: cd chestsim && cargo build --release
+      - uses: actions/setup-python@v5
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.12"
+      - if: runner.environment == 'github-hosted'
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch && pip install numpy
+      - name: Starting weights
+        env:
+          FILE: ${{ fromJSON(needs.plan.outputs.cfg).init_file }}
+        run: mkdir -p init && if [ -n "$FILE" ]; then cp "$FILE" init/init.pt; fi
+      - name: Train
+        env:
+          CFG: ${{ needs.plan.outputs.cfg }}
+          MACHINE: ${{ matrix.machine }}
+        run: |
+          M=$(python3 pool/plan.py minutes)
+          N=$(python3 -c "import json,os;print(json.loads(os.environ['CFG'])['_total'])")
+          R=$(python3 -c "import json,os;print(json.loads(os.environ['CFG'])['round_minutes'])")
+          A=$(python3 -c "import json,os;print(json.loads(os.environ['CFG'])['args'])")
+          export CHESTAI_TAG=$(python3 -c "import json,os;print(json.loads(os.environ['CFG'])['_tag'])")
+          export CHESTAI_REMOTES=$(python3 -c "import json,os;print(json.loads(os.environ['CFG'])['_remotes'])")
+          export CHESTAI_PREFIX=$(python3 -c "import json,os;print(json.loads(os.environ['CFG'])['_prefix'])")
+          export CHESTAI_GRACE=60
+          export CHESTAI_ORIGIN_DIR="$GITHUB_WORKSPACE"
+          T=$(python3 pool/plan.py start)
+          D="$GITHUB_WORKSPACE/main/chestai"
+          S="$D/share"
+          mkdir -p "$S"
+          cd python
+          python train.py --minutes "$M" --out ../runs/m$MACHINE --init ../init/init.pt --threads 4 \
+            --machine-id "$MACHINE" --machines "$N" --round-minutes "$R" --share-dir "$S" --start-at "$T" \
+            --sync-cmd "bash $D/sync.sh $S $MACHINE $N {round} $D/runs/m$MACHINE" --seed $MACHINE $A
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chestai-m${{ matrix.machine }}-log
+          path: main/chestai/runs/m${{ matrix.machine }}/log.jsonl
+          if-no-files-found: ignore
