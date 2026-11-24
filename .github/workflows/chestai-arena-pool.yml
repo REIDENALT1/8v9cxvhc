@@ -1,0 +1,79 @@
+name: chestai-arena-pool
+
+# Arena seeds played for the main repo on this repo's machines (its own share of
+# runners): arena.json names the main repo, the commit (ref) to play, the seeds and
+# the variants (each a .jvm in chestai/arena there). Each seed's numbers are kept as
+# an artifact arena-<seed>-<variant>, as the main repo's own arena keeps them.
+on:
+  push:
+    branches-ignore: ["chestai-sync/**"]
+    paths: ["arena.json"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chestai-arena-pool
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    if: contains(github.event.head_commit.message, '[chestai-arena]')
+    runs-on: ubuntu-latest
+    outputs:
+      cfg: ${{ steps.c.outputs.cfg }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: c
+        run: echo "cfg=$(python3 -c 'import json;print(json.dumps(json.load(open("arena.json"))))')" >> "$GITHUB_OUTPUT"
+  play:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ${{ fromJSON(needs.plan.outputs.cfg).seeds }}
+        variant: ${{ fromJSON(needs.plan.outputs.cfg).variants }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: main/chestai/mod
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ fromJSON(needs.plan.outputs.cfg).main }}
+          ref: ${{ fromJSON(needs.plan.outputs.cfg).ref }}
+          path: main
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "8"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+      - name: Play seed ${{ matrix.seed }} (${{ matrix.variant }})
+        run: |
+          J=""
+          S=$(( ${{ matrix.seed }} + 1000 ))
+          if [ -f "../arena/${{ matrix.variant }}.jvm" ]; then J="$(tr '\n' ' ' < ../arena/${{ matrix.variant }}.jvm)"; fi
+          J="${J//@ARENA@/$GITHUB_WORKSPACE/main/chestai/arena}"
+          sudo apt-get update -q
+          sudo apt-get install -y -q xvfb x11-xserver-utils libgl1-mesa-dri libglx-mesa0 libxrandr2 libxcursor1 libxxf86vm1 libxi6 libxtst6 libxrender1 > /dev/null
+          LIBGL_ALWAYS_SOFTWARE=1 timeout 3000 xvfb-run -a -s "-screen 0 854x480x24" gradle arena -Parena.seed=$S -Parena.seconds=900 -Parena.variant=${{ matrix.variant }} "-Parena.jvm=$J" --no-daemon --stacktrace > arena.log 2>&1 || true
+          mkdir -p out
+          cp run/arena.txt out/ 2>/dev/null || echo "seed=${{ matrix.seed }} FAILED" > out/arena.txt
+          cp run/config/chestai/registro.txt out/ 2>/dev/null || true
+          grep -v -e '^\s*at ' arena.log | grep -e ARENA -e Exception -e ERROR -e HURT | tail -n 400 > out/client.txt || true
+          grep -e 'ARENA stuckEp' -e 'ARENA death' -e 'ARENA wave' -e 'ARENA reset' -e 'ARENA cleared' -e 'ARENA claim' -e 'ARENA spin' arena.log | sed 's/^.*\]: //' > out/events.txt || true
+          cat out/arena.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arena-${{ matrix.seed }}-${{ matrix.variant }}
+          path: main/chestai/mod/out
+          retention-days: 7
